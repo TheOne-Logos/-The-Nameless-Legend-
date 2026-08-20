@@ -1,0 +1,508 @@
+// main.cpp
+// Viewer for worldmap produced by Weather.cpp (binary format "WORLDMAPBIN").
+// Adds mouse-wheel zoom, pixel-level panning (drag & keys), and click-to-query.
+// Build: g++ -std=c++14 -O2 -o viewer main.cpp `sdl2-config --cflags --libs`
+// Run: ./viewer [worldmap.bin]
+
+#include <SDL.h>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+
+// ---------- display config ----------
+const int WINDOW_W = 100;            // window pixels
+const int WINDOW_H = 100;
+
+// ---------- defaults ----------
+const char* DEFAULT_FILE = "worldmap.bin";
+
+// ---------- display mapping (exactly 10 slots: keys 0..9) ----------
+const int NUM_DISPLAY_SLOTS = 10;
+const int DISPLAY_MAP[NUM_DISPLAY_SLOTS] = {
+    0,  // 0 -> ELEVATION
+    1,  // 1 -> TEMP
+    2,  // 2 -> PRECIP
+    3,  // 3 -> BIOME
+    5,  // 4 -> TERRAIN  (skip LAND_OCEAN)
+    6,  // 5 -> VEGETATION
+    7,  // 6 -> SOIL_FERT
+    19, // 7 -> NPP
+    10, // 8 -> GROUNDWATER
+    18  // 9 -> ARIDITY
+};
+
+// ---------- helper color struct ----------
+struct RGB { Uint8 r,g,b,a; };
+static inline RGB make_color(int r,int g,int b,int a=255){ return { (Uint8)r,(Uint8)g,(Uint8)b,(Uint8)a }; }
+
+// ---------- interpolation helpers ----------
+static inline double lerp(double a, double b, double t) { return a + (b - a) * t; }
+static inline Uint8 lerp8(Uint8 a, Uint8 b, double t) { return (Uint8)(a + (b - a) * t); }
+
+// ---------- palettes ----------
+RGB biome_palette(int code) {
+    switch (code) {
+        case 0: return make_color(255,160,60);
+        case 1: return make_color(30,160,255);
+        case 2: return make_color(20,80,220);
+        case 3: return make_color(10,40,140);
+        case 4: return make_color(0,0,80);
+        case 5: return make_color(240,240,255);
+        case 6: return make_color(250,220,120);
+        case 7: return make_color(255,160,100);
+        case 8: return make_color(120,200,80);
+        case 9: return make_color(30,180,40);
+        case 10: return make_color(10,140,40);
+        case 11: return make_color(0,120,60);
+        case 12: return make_color(0,180,120);
+        case 13: return make_color(20,150,120);
+        case 14: return make_color(150,180,160);
+        case 15: return make_color(200,200,200);
+        case 16: return make_color(180,160,160);
+        case 17: return make_color(240,240,255);
+        case 18: return make_color(220,220,220);
+        case 19: return make_color(200,220,220);
+        case 20: return make_color(200,200,220);
+        case 21: return make_color(200,200,180);
+        case 22: return make_color(255,255,255);
+    }
+    return make_color(255,0,255);
+}
+
+RGB terrain_palette(int code) {
+    switch (code) {
+        case 0: return make_color(0,0,40);
+        case 1: return make_color(0,40,120);
+        case 2: return make_color(0,80,200);
+        case 3: return make_color(60,150,220);
+        case 4: return make_color(160,220,180);
+        case 5: return make_color(200,240,200);
+        case 6: return make_color(210,200,150);
+        case 7: return make_color(190,170,120);
+        case 8: return make_color(160,140,120);
+        case 9: return make_color(120,100,90);
+    }
+    return make_color(255,0,255);
+}
+
+RGB vegetation_palette(int code) {
+    switch (code) {
+        case 0: return make_color(200,200,200);
+        case 1: return make_color(250,220,150);
+        case 2: return make_color(190,240,120);
+        case 3: return make_color(30,150,30);
+        case 4: return make_color(0,200,120);
+        case 5: return make_color(100,160,100);
+        case 6: return make_color(200,220,200);
+        case 7: return make_color(240,240,250);
+        case 8: return make_color(20,160,120);
+    }
+    return make_color(255,0,255);
+}
+
+RGB palette_elevation(double v) {
+    struct Stop { double val; RGB c; };
+    const std::vector<Stop> stops = {
+        {-10000, make_color(0,0,80)},
+        {-5000,  make_color(0,0,160)},
+        {-3000,  make_color(0,60,200)},
+        {-200,   make_color(60,150,220)},
+        {-30,    make_color(120,200,240)},
+        {0,      make_color(80,200,120)},
+        {150,    make_color(60,180,60)},
+        {600,    make_color(150,200,80)},
+        {1500,   make_color(200,180,100)},
+        {2800,   make_color(180,130,80)},
+        {4000,   make_color(160,110,60)},
+        {8000,   make_color(220,220,230)}
+    };
+    if (v <= stops.front().val) return stops.front().c;
+    if (v >= stops.back().val) return stops.back().c;
+    for (size_t i = 0; i+1 < stops.size(); ++i) {
+        if (v >= stops[i].val && v < stops[i+1].val) {
+            double t = (v - stops[i].val) / (stops[i+1].val - stops[i].val);
+            RGB a = stops[i].c, b = stops[i+1].c;
+            return make_color(lerp8(a.r,b.r,t), lerp8(a.g,b.g,t), lerp8(a.b,b.b,t));
+        }
+    }
+    return stops.back().c;
+}
+
+RGB palette_temperature(double t) {
+    double minT = -40.0, maxT = 40.0;
+    double u = (t - minT) / (maxT - minT);
+    u = std::max(0.0, std::min(1.0, u));
+    if (u < 0.5) {
+        double v = u / 0.5;
+        return make_color((int)lerp(0,255*v,v), (int)lerp(60,255,v), (int)lerp(200,255,v));
+    } else {
+        double v = (u - 0.5) / 0.5;
+        return make_color((int)lerp(255*v,255,v), (int)lerp(255,40,v), (int)lerp(255,0,v));
+    }
+}
+
+RGB palette_precip(double p) {
+    double u = p / 2000.0;
+    u = std::max(0.0, std::min(1.0, u));
+    if (u < 0.5) {
+        return make_color((int)lerp(210,120,u*2.0), (int)lerp(180,200,u*2.0), (int)lerp(140,60,u*2.0));
+    } else {
+        double v = (u - 0.5) * 2.0;
+        return make_color((int)lerp(120,20,v), (int)lerp(200,120,v), (int)lerp(60,200,v));
+    }
+}
+
+RGB palette_generic_gradient(double v, double vmin, double vmax, RGB cmin, RGB cmax) {
+    double u = (v - vmin) / (vmax - vmin);
+    u = std::max(0.0, std::min(1.0, u));
+    return make_color(lerp8(cmin.r, cmax.r, u), lerp8(cmin.g, cmax.g, u), lerp8(cmin.b, cmax.b, u));
+}
+
+// ---------- loaders ----------
+// Binary loader for format produced by Weather.cpp:
+// "WORLDMAPBIN" (11 bytes), int32 width, int32 height, int32 layers,
+// then for each layer: uint16 name_len + name bytes,
+// then raw doubles layer-major: layers * height * width doubles
+bool load_world_binary(const std::string& filename,
+                       std::vector<double>& data,
+                       std::vector<std::string>& layer_names,
+                       int& map_w, int& map_h, int& layers_count)
+{
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) return false;
+    char magicBuf[12] = {};
+    in.read(magicBuf, 11);
+    if (!in) return false;
+    std::string magic(magicBuf, 11);
+    if (magic != "WORLDMAPBIN") {
+        return false;
+    }
+    int32_t w=0,h=0,layers=0;
+    in.read(reinterpret_cast<char*>(&w), sizeof(w));
+    in.read(reinterpret_cast<char*>(&h), sizeof(h));
+    in.read(reinterpret_cast<char*>(&layers), sizeof(layers));
+    if (!in) return false;
+    if (w<=0 || h<=0 || layers<=0) return false;
+    map_w = w; map_h = h; layers_count = layers;
+    layer_names.clear();
+    for (int i=0;i<layers;i++) {
+        uint16_t len=0;
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        if (!in) return false;
+        std::string lname;
+        lname.resize(len);
+        in.read(&lname[0], len);
+        if (!in) return false;
+        layer_names.push_back(lname);
+    }
+    size_t total = (size_t)layers * (size_t)h * (size_t)w;
+    data.resize(total);
+    in.read(reinterpret_cast<char*>(data.data()), total * sizeof(double));
+    // if file shorter, that's an error but we keep what we have
+    if (!in && !in.eof()) {
+        std::cerr << "Warning: binary read incomplete or failed\n";
+    }
+    return true;
+}
+
+// Fallback text loader (original WORLDMAP text)
+bool load_world_text(const std::string& filename,
+                     std::vector<double>& data,
+                     std::vector<std::string>& layer_names,
+                     int& map_w, int& map_h, int& layers_count)
+{
+    std::ifstream in(filename);
+    if (!in) return false;
+    std::string header;
+    in >> header;
+    if (header != "WORLDMAP") return false;
+    int layers;
+    in >> map_w >> map_h >> layers;
+    if (map_w<=0 || map_h<=0 || layers<=0) return false;
+    layers_count = layers;
+    layer_names.resize(layers);
+    data.assign((size_t)layers * map_h * map_w, 0.0);
+    for (int l=0;l<layers;l++) {
+        std::string lname;
+        in >> lname;
+        layer_names[l] = lname;
+        for (int y=0;y<map_h;y++) {
+            for (int x=0;x<map_w;x++) {
+                double v;
+                in >> v;
+                data[(size_t)l*map_h*map_w + (size_t)y*map_w + (size_t)x] = v;
+            }
+        }
+    }
+    return true;
+}
+
+// Unified loader: try binary then text
+bool load_world(const std::string& filename,
+                std::vector<double>& data,
+                std::vector<std::string>& layer_names,
+                int& map_w, int& map_h, int& layers_count)
+{
+    if (load_world_binary(filename, data, layer_names, map_w, map_h, layers_count)) {
+        std::cout << "Loaded binary file '" << filename << "' (" << layers_count << " layers, " << map_w << "x" << map_h << ")\n";
+        return true;
+    }
+    if (load_world_text(filename, data, layer_names, map_w, map_h, layers_count)) {
+        std::cout << "Loaded text file '" << filename << "' (" << layers_count << " layers, " << map_w << "x" << map_h << ")\n";
+        return true;
+    }
+    return false;
+}
+
+// get value from layer-major data
+inline double get_value(const std::vector<double>& data, int layers, int w, int h, int layer, int y, int x) {
+    if (layer < 0 || layer >= layers) return 0.0;
+    if (x < 0 || x >= w || y < 0 || y >= h) return 0.0;
+    return data[(size_t)layer * h * w + (size_t)y * w + (size_t)x];
+}
+
+// color for display slot
+RGB color_for_slot(const std::vector<double>& data, int layers, int w, int h, int slot, int y, int x) {
+    int layer_idx = DISPLAY_MAP[slot];
+    double v = get_value(data, layers, w, h, layer_idx, y, x);
+    switch (slot) {
+        case 0: return palette_elevation(v);
+        case 1: return palette_temperature(v);
+        case 2: return palette_precip(v);
+        case 3: { int code = static_cast<int>(std::round(v)); return biome_palette(code); }
+        case 4: { int t = static_cast<int>(std::round(v)); return terrain_palette(t); }
+        case 5: { int vv = static_cast<int>(std::round(v)); return vegetation_palette(vv); }
+        case 6: return palette_generic_gradient(v, 0.0, 5.0, make_color(140,90,40), make_color(10,200,60));
+        case 7: return palette_generic_gradient(v, 0.0, 3000.0, make_color(240,240,220), make_color(0,180,40));
+        case 8: return palette_generic_gradient(v, 0.0, 1.0, make_color(220,240,255), make_color(0,40,200));
+        case 9: return palette_generic_gradient(v, 0.0, 2.0, make_color(20,180,40), make_color(200,160,60));
+        default: return make_color(255,0,255);
+    }
+}
+
+// ---------- Main ----------
+int main(int argc, char* argv[]) {
+    std::string fname = (argc >= 2) ? argv[1] : DEFAULT_FILE;
+
+    std::vector<double> data;
+    std::vector<std::string> layer_names;
+    int map_w=0, map_h=0, layers=0;
+    if (!load_world(fname, data, layer_names, map_w, map_h, layers)) {
+        std::cerr << "Failed to load world file: " << fname << "\n";
+        return 1;
+    }
+
+    // validate mapping indices
+    for (int i=0;i<NUM_DISPLAY_SLOTS;++i) {
+        int idx = DISPLAY_MAP[i];
+        if (idx < 0 || idx >= layers) {
+            std::cerr << "Display slot " << i << " maps to invalid layer index " << idx << " (file has " << layers << " layers)\n";
+            return 1;
+        }
+    }
+
+    std::cout << "Map size: " << map_w << " x " << map_h << " , layers: " << layers << "\n";
+    std::cout << "Controls: Keys 0..9 select layers, mouse wheel zoom, drag to pan, arrow/WASD to pan (fine), click to query cell value.\n";
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        std::cerr << "SDL_Init error: " << SDL_GetError() << "\n";
+        return 1;
+    }
+
+    SDL_Window* window = SDL_CreateWindow(("World Viewer - " + fname).c_str(),
+                                          SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                          WINDOW_W, WINDOW_H, SDL_WINDOW_SHOWN);
+    if (!window) {
+        std::cerr << "SDL_CreateWindow error: " << SDL_GetError() << "\n";
+        SDL_Quit();
+        return 1;
+    }
+
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if (!renderer) {
+        std::cerr << "SDL_CreateRenderer error: " << SDL_GetError() << "\n";
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+
+    // viewport position in map coordinates (fractional, top-left cell)
+    double view_x = 0.0, view_y = 0.0;
+    // zoom = pixels per cell
+    double zoom = 1.0;
+    const double ZOOM_MIN = 0.1;
+    const double ZOOM_MAX = 64.0;
+
+    auto clamp_view = [&](void){
+        double max_x = std::max(0.0, (double)map_w - (double)WINDOW_W / zoom);
+        double max_y = std::max(0.0, (double)map_h - (double)WINDOW_H / zoom);
+        if (view_x < 0.0) view_x = 0.0;
+        if (view_y < 0.0) view_y = 0.0;
+        if (view_x > max_x) view_x = max_x;
+        if (view_y > max_y) view_y = max_y;
+    };
+
+    int current_slot = 0;
+
+    bool running = true;
+    SDL_Event ev;
+
+    bool dragging = false;
+    int drag_last_x = 0, drag_last_y = 0;
+
+    while (running) {
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                running = false;
+            } else if (ev.type == SDL_KEYDOWN) {
+                SDL_Keycode k = ev.key.keysym.sym;
+                if (k >= SDLK_0 && k <= SDLK_9) {
+                    int n = k - SDLK_0;
+                    if (n < NUM_DISPLAY_SLOTS) current_slot = n;
+                } else if (k >= SDLK_KP_0 && k <= SDLK_KP_9) {
+                    int n = k - SDLK_KP_0;
+                    if (n < NUM_DISPLAY_SLOTS) current_slot = n;
+                } else {
+                    // pan by 10 screen pixels (converted to map units)
+                    double step_map = 10.0 / zoom;
+                    switch (k) {
+                        case SDLK_LEFT: case SDLK_a: view_x -= step_map; break;
+                        case SDLK_RIGHT: case SDLK_d: view_x += step_map; break;
+                        case SDLK_UP: case SDLK_w: view_y -= step_map; break;
+                        case SDLK_DOWN: case SDLK_s: view_y += step_map; break;
+                        case SDLK_HOME: view_x = 0.0; view_y = 0.0; break;
+                        case SDLK_END: {
+                            view_x = std::max(0.0, (double)map_w - (double)WINDOW_W/zoom);
+                            view_y = std::max(0.0, (double)map_h - (double)WINDOW_H/zoom);
+                            break;
+                        }
+                        case SDLK_PAGEUP:
+                            view_y -= (double)WINDOW_H/zoom; break;
+                        case SDLK_PAGEDOWN:
+                            view_y += (double)WINDOW_H/zoom; break;
+                        default: break;
+                    }
+                    clamp_view();
+                }
+            } else if (ev.type == SDL_MOUSEWHEEL) {
+                // zoom centered at mouse position
+                int mx, my;
+                SDL_GetMouseState(&mx, &my);
+                double mouse_map_x = view_x + (double)mx / zoom;
+                double mouse_map_y = view_y + (double)my / zoom;
+                if (ev.wheel.y > 0) zoom *= 1.20;
+                else if (ev.wheel.y < 0) zoom /= 1.20;
+                zoom = std::max(ZOOM_MIN, std::min(ZOOM_MAX, zoom));
+                // adjust view to keep mouse_map coords under cursor
+                view_x = mouse_map_x - (double)mx / zoom;
+                view_y = mouse_map_y - (double)my / zoom;
+                clamp_view();
+            } else if (ev.type == SDL_MOUSEBUTTONDOWN) {
+                if (ev.button.button == SDL_BUTTON_LEFT) {
+                    dragging = true;
+                    drag_last_x = ev.button.x;
+                    drag_last_y = ev.button.y;
+                }
+            } else if (ev.type == SDL_MOUSEBUTTONUP) {
+                if (ev.button.button == SDL_BUTTON_LEFT) {
+                    // if the mouse wasn't moved significantly, treat as click-to-query
+                    int dx = ev.button.x - drag_last_x;
+                    int dy = ev.button.y - drag_last_y;
+                    const int DRAG_THRESHOLD = 4;
+                    if (std::abs(dx) < DRAG_THRESHOLD && std::abs(dy) < DRAG_THRESHOLD) {
+                        double map_x = view_x + (double)ev.button.x / zoom;
+                        double map_y = view_y + (double)ev.button.y / zoom;
+                        int ix = static_cast<int>(std::floor(map_x));
+                        int iy = static_cast<int>(std::floor(map_y));
+                        int layer_idx = DISPLAY_MAP[current_slot];
+                        double val = get_value(data, layers, map_w, map_h, layer_idx, iy, ix);
+                        std::cout << "Click query: map=(" << ix << "," << iy << ") layer=" << layer_idx
+                                  << " (" << (layer_idx < (int)layer_names.size() ? layer_names[layer_idx] : "unnamed")
+                                  << ") value=" << val << "\n";
+                        // show in window title as feedback
+                        std::string title = "Layer " + std::to_string(current_slot) + " (l=" + std::to_string(layer_idx) + ") "
+                            + (layer_idx < (int)layer_names.size() ? layer_names[layer_idx] : "unnamed")
+                            + "  Pos: (" + std::to_string((int)std::round(view_x)) + "," + std::to_string((int)std::round(view_y)) + ") "
+                            + "Query: (" + std::to_string(ix) + "," + std::to_string(iy) + ") val=" + std::to_string(val);
+                        SDL_SetWindowTitle(window, title.c_str());
+                    }
+                    dragging = false;
+                }
+            } else if (ev.type == SDL_MOUSEMOTION) {
+                if (dragging) {
+                    int mx = ev.motion.x;
+                    int my = ev.motion.y;
+                    int ddx = mx - drag_last_x;
+                    int ddy = my - drag_last_y;
+                    // translate mouse movement into map offsets (dragging moves the map)
+                    view_x -= (double)ddx / zoom;
+                    view_y -= (double)ddy / zoom;
+                    drag_last_x = mx;
+                    drag_last_y = my;
+                    clamp_view();
+                }
+            }
+        } // event loop
+
+        // render visible cells with fractional offsets
+        // determine which map cell indices to draw
+        int start_x = static_cast<int>(std::floor(view_x));
+        int start_y = static_cast<int>(std::floor(view_y));
+        double offset_x = view_x - (double)start_x; // fraction of cell at left
+        double offset_y = view_y - (double)start_y;
+
+        // number of cells to cover window (add one extra for partial)
+        int cells_w = static_cast<int>(std::ceil((double)WINDOW_W / zoom)) + 1;
+        int cells_h = static_cast<int>(std::ceil((double)WINDOW_H / zoom)) + 1;
+
+        // clear
+        SDL_SetRenderDrawColor(renderer, 0,0,0,255);
+        SDL_RenderClear(renderer);
+
+        // draw each visible map cell as rectangle sized by zoom, positioned by fractional offsets
+        for (int j = 0; j < cells_h; ++j) {
+            int y = start_y + j;
+            if (y < 0 || y >= map_h) continue;
+            // compute pixel y positions for current and next row to avoid rounding gaps
+            int py0 = (int)std::floor(( (double)j - offset_y) * zoom);
+            int py1 = (int)std::floor(( (double)j + 1.0 - offset_y) * zoom);
+            int ph = py1 - py0;
+            if (ph <= 0) ph = 1;
+            for (int i = 0; i < cells_w; ++i) {
+                int x = start_x + i;
+                if (x < 0 || x >= map_w) continue;
+                int px0 = (int)std::floor(( (double)i - offset_x) * zoom);
+                int px1 = (int)std::floor(( (double)i + 1.0 - offset_x) * zoom);
+                int pw = px1 - px0;
+                if (pw <= 0) pw = 1;
+                RGB c = color_for_slot(data, layers, map_w, map_h, current_slot, y, x);
+                SDL_SetRenderDrawColor(renderer, c.r, c.g, c.b, c.a);
+                SDL_Rect r = { px0, py0, pw, ph };
+                // clip to window
+                if (r.x + r.w < 0 || r.y + r.h < 0 || r.x >= WINDOW_W || r.y >= WINDOW_H) continue;
+                SDL_RenderFillRect(renderer, &r);
+            }
+        }
+
+        // update title with current layer & pos
+        int layer_idx = DISPLAY_MAP[current_slot];
+        std::string layer_name = (layer_idx < (int)layer_names.size()) ? layer_names[layer_idx] : "unknown";
+        std::string title = "Layer " + std::to_string(current_slot) + " (l=" + std::to_string(layer_idx) + ":" + layer_name + ") Pos:("
+                            + std::to_string((int)std::floor(view_x)) + "," + std::to_string((int)std::floor(view_y)) + ") Zoom:"
+                            + std::to_string(zoom);
+        SDL_SetWindowTitle(window, title.c_str());
+
+        SDL_RenderPresent(renderer);
+        SDL_Delay(16);
+    }
+
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return 0;
+}
